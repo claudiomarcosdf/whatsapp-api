@@ -1,5 +1,6 @@
 function keyVerification(req, res, next) {
     const key = req.query['key']?.toString()
+
     if (!key) {
         return res
             .status(403)
