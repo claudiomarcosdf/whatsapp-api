@@ -5,10 +5,7 @@ module.exports = async function connectToCluster(uri) {
     let mongoClient
 
     try {
-        mongoClient = new MongoClient(uri, {
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
-        })
+        mongoClient = new MongoClient(uri)
         logger.info('STATE: Connecting to MongoDB')
         await mongoClient.connect()
         logger.info('STATE: Successfully connected to MongoDB')

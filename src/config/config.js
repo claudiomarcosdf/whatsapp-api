@@ -38,7 +38,9 @@ const WEBHOOK_BASE64 = !!(
     process.env.WEBHOOK_BASE64 && process.env.WEBHOOK_BASE64 === 'true'
 )
 // allowed events which should be sent to webhook
-const WEBHOOK_ALLOWED_EVENTS = process.env.WEBHOOK_ALLOWED_EVENTS?.split(',') || ['all']
+const WEBHOOK_ALLOWED_EVENTS = process.env.WEBHOOK_ALLOWED_EVENTS?.split(
+    ','
+) || ['all']
 // Mark messages as seen
 const MARK_MESSAGES_READ = !!(
     process.env.MARK_MESSAGES_READ && process.env.MARK_MESSAGES_READ === 'true'
@@ -60,8 +62,8 @@ module.exports = {
         url: MONGODB_URL,
         options: {
             // useCreateIndex: true,
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
+            //useNewUrlParser: true,
+            //useUnifiedTopology: true,
         },
     },
     browser: {
@@ -74,5 +76,5 @@ module.exports = {
     webhookBase64: WEBHOOK_BASE64,
     protectRoutes: PROTECT_ROUTES,
     markMessagesRead: MARK_MESSAGES_READ,
-    webhookAllowedEvents: WEBHOOK_ALLOWED_EVENTS
+    webhookAllowedEvents: WEBHOOK_ALLOWED_EVENTS,
 }
