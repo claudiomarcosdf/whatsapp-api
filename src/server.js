@@ -1,3 +1,14 @@
+// WebCrypto global faz falta no Node 16 e derruba o socket do Baileys
+// ("crypto is not defined" no handshake, antes mesmo do QR). Polyfill antes
+// de qualquer uso.
+try {
+    if (typeof globalThis.crypto === 'undefined') {
+        const { webcrypto } = require('crypto')
+        globalThis.crypto = webcrypto
+    }
+} catch (_) {
+    // sem WebCrypto disponivel o QR nao sera gerado; ver logs
+}
 const dotenv = require('dotenv')
 const mongoose = require('mongoose')
 const logger = require('pino')()
