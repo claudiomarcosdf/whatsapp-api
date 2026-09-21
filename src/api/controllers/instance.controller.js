@@ -46,7 +46,8 @@ exports.init = async (req, res) => {
 
 exports.qr = async (req, res) => {
     try {
-        let qrcode = await WhatsAppInstances[req.query.key]?.instance.qr
+        const qrcode =
+            WhatsAppInstances[req.query.key]?.instance.qr ?? ''
         res.render('qrcode', {
             qrcode: qrcode,
         })
@@ -59,14 +60,67 @@ exports.qr = async (req, res) => {
 
 exports.qrbase64 = async (req, res) => {
     try {
-        const qrcode = await WhatsAppInstances[req.query.key]?.instance.qr
-        res.json({
-            error: false,
-            message: 'QR Base64 fetched successfully',
-            qrcode: qrcode,
+        const instance = WhatsAppInstances[req.query.key]
+        const qrcode = instance?.instance?.qr ?? ''
+        const online = !!instance?.instance?.online
+        const qrRetry = instance?.instance?.qrRetry ?? 0
+        const maxRetry = Number(config.instance.maxRetryQr)
+
+        // Ja conectado: nao ha QR a escanear (evita falso sucesso com "")
+        if (online) {
+            return res.json({
+                error: false,
+                message: 'Phone connected, QR not needed',
+                qrcode: '',
+                connected: true,
+                online: online,
+                qrRetry: qrRetry,
+                maxRetry: maxRetry,
+            })
+        }
+
+        // QR valido disponivel
+        if (qrcode && qrcode.trim() !== '') {
+            return res.json({
+                error: false,
+                message: 'QR Base64 fetched successfully',
+                qrcode: qrcode,
+                connected: false,
+                online: online,
+                qrRetry: qrRetry,
+                maxRetry: maxRetry,
+            })
+        }
+
+        // QR expirado pelo maxRetry (instance.js seta ' ' ao encerrar)
+        if (qrRetry >= maxRetry) {
+            return res.json({
+                error: true,
+                message:
+                    'QR expired, call /instance/init with the same key to generate a new one',
+                qrcode: '',
+                connected: false,
+                online: online,
+                qrRetry: qrRetry,
+                maxRetry: maxRetry,
+                expired: true,
+            })
+        }
+
+        // QR ainda nao gerado (race entre /init e evento qr do Baileys)
+        return res.json({
+            error: true,
+            message: 'QR not ready yet, try again in a few seconds',
+            qrcode: '',
+            connected: false,
+            online: online,
+            qrRetry: qrRetry,
+            maxRetry: maxRetry,
         })
     } catch {
         res.json({
+            error: true,
+            message: 'Unable to fetch QR',
             qrcode: '',
         })
     }
@@ -78,7 +132,22 @@ exports.info = async (req, res) => {
     try {
         data = await instance.getInstanceDetail(req.query.key)
     } catch (error) {
-        data = {}
+        data = {
+            instance_key: req.query.key,
+            phone_connected: false,
+            webhookUrl: null,
+            user: {},
+        }
+    }
+    // Garante formato estavel: phone_connected sempre boolean, user sempre objeto
+    if (typeof data.phone_connected !== 'boolean') {
+        data.phone_connected = !!data.phone_connected
+    }
+    if (!data.user || typeof data.user !== 'object') {
+        data.user = {}
+    }
+    if (!('webhookUrl' in data)) {
+        data.webhookUrl = null
     }
     return res.json({
         error: false,

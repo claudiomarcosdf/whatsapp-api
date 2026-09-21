@@ -36,6 +36,8 @@ class WhatsAppInstance {
         qr: '',
         messages: [],
         qrRetry: 0,
+        qrAt: null,
+        online: false,
         customWebhook: '',
     }
 
@@ -45,6 +47,7 @@ class WhatsAppInstance {
 
     constructor(key, allowWebhook, webhook) {
         this.key = key ? key : uuidv4()
+        this.instance.key = this.key
         this.instance.customWebhook = this.webhook ? this.webhook : webhook
         this.allowWebhook = config.webhookEnabled
             ? config.webhookEnabled
@@ -75,6 +78,17 @@ class WhatsAppInstance {
         this.authState = { state: state, saveCreds: saveCreds }
         this.socketConfig.auth = this.authState.state
         this.socketConfig.browser = Object.values(config.browser)
+        // Novo ciclo: limpa estado anterior sem acumular entre reconexoes
+        try {
+            this.instance.sock?.ev?.removeAllListeners()
+        } catch (_) {
+            // ignora: socket anterior pode ja estar fechado
+        }
+        this.instance.key = this.key
+        this.instance.qr = ''
+        this.instance.qrRetry = 0
+        this.instance.qrAt = null
+        this.instance.online = false
         this.instance.sock = makeWASocket(this.socketConfig)
         this.setHandler()
         return this
@@ -89,15 +103,52 @@ class WhatsAppInstance {
         sock?.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update
 
+            // QR precisa ser processado mesmo quando connection === 'connecting',
+            // pois o Baileys envia { connection: 'connecting', qr: '...' }
+            if (qr) {
+                QRCode.toDataURL(qr)
+                    .then(async (url) => {
+                        this.instance.qr = url
+                        this.instance.qrAt = new Date().toISOString()
+                        this.instance.qrRetry++
+                        if (
+                            this.instance.qrRetry >=
+                            Number(config.instance.maxRetryQr)
+                        ) {
+                            // close WebSocket connection
+                            try {
+                                this.instance.sock.ws.close()
+                            } catch (_) {
+                                // socket pode ja estar fechado
+                            }
+                            // remove all events
+                            this.instance.sock.ev.removeAllListeners()
+                            this.instance.qr = ' '
+                            this.instance.online = false
+                            logger.info('socket connection terminated')
+                        }
+                    })
+                    .catch((e) => {
+                        logger.error('Error generating QR code')
+                        logger.error(e)
+                    })
+            }
+
             if (connection === 'connecting') return
 
             if (connection === 'close') {
+                this.instance.online = false
                 // reconnect if not logged out
                 if (
                     lastDisconnect?.error?.output?.statusCode !==
                     DisconnectReason.loggedOut
                 ) {
-                    await this.init()
+                    try {
+                        await this.init()
+                    } catch (e) {
+                        logger.error('Error reconnecting instance')
+                        logger.error(e)
+                    }
                 } else {
                     await this.collection.drop().then((r) => {
                         logger.info('STATE: Droped collection')
@@ -131,6 +182,10 @@ class WhatsAppInstance {
                     }
                 }
                 this.instance.online = true
+                // Conectado: nao ha QR pendente
+                this.instance.qr = ''
+                this.instance.qrAt = null
+                this.instance.qrRetry = 0
                 if (
                     [
                         'all',
@@ -146,21 +201,6 @@ class WhatsAppInstance {
                         },
                         this.key
                     )
-            }
-
-            if (qr) {
-                QRCode.toDataURL(qr).then(async (url) => {
-                    this.instance.qr = url
-                    this.instance.qrRetry++
-                    if (this.instance.qrRetry >= config.instance.maxRetryQr) {
-                        // close WebSocket connection
-                        this.instance.sock.ws.close()
-                        // remove all events
-                        this.instance.sock.ev.removeAllListeners()
-                        this.instance.qr = ' '
-                        logger.info('socket connection terminated')
-                    }
-                })
             }
         })
 
@@ -424,11 +464,22 @@ class WhatsAppInstance {
     }
 
     async getInstanceDetail(key) {
+        const online = !!this.instance?.online
+        const sockUser = this.instance?.sock?.user
+        const credsMe = this.authState?.state?.creds?.me
+        let user = {}
+        if (sockUser && Object.keys(sockUser).length > 0) {
+            user = { ...sockUser }
+        } else if (credsMe && Object.keys(credsMe).length > 0) {
+            // Fallback: credencial persistida no Mongo (sessao restaurada,
+            // socket ainda conectando ou user ainda nao populado)
+            user = { ...credsMe }
+        }
         return {
             instance_key: key,
-            phone_connected: this.instance?.online,
-            webhookUrl: this.instance.customWebhook,
-            user: this.instance?.online ? { ...this.instance.sock?.user } : {},
+            phone_connected: online,
+            webhookUrl: this.instance?.customWebhook ?? null,
+            user: user,
         }
     }
 

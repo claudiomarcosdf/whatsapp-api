@@ -14,28 +14,32 @@ class Session {
                 allCollections.push(collection.name)
             })
 
-            allCollections.map((key) => {
-                const query = {}
-                db.collection(key)
-                    .find(query)
-                    .toArray(async (err, result) => {
-                        if (err) throw err
-                        const webhook = !config.webhookEnabled
-                            ? undefined
-                            : config.webhookEnabled
-                        const webhookUrl = !config.webhookUrl
-                            ? undefined
-                            : config.webhookUrl
-                        const instance = new WhatsAppInstance(
-                            key,
-                            webhook,
-                            webhookUrl
-                        )
-                        await instance.init()
-                        WhatsAppInstances[key] = instance
-                    })
-                restoredSessions.push(key)
-            })
+            for (const key of allCollections) {
+                try {
+                    // Evita 2 sockets para a mesma key (restore + /init concorrente)
+                    if (WhatsAppInstances[key]) {
+                        restoredSessions.push(key)
+                        continue
+                    }
+                    const webhook = !config.webhookEnabled
+                        ? undefined
+                        : config.webhookEnabled
+                    const webhookUrl = !config.webhookUrl
+                        ? undefined
+                        : config.webhookUrl
+                    const instance = new WhatsAppInstance(
+                        key,
+                        webhook,
+                        webhookUrl
+                    )
+                    await instance.init()
+                    WhatsAppInstances[key] = instance
+                    restoredSessions.push(key)
+                } catch (err) {
+                    logger.error(`Error restoring session ${key}`)
+                    logger.error(err)
+                }
+            }
         } catch (e) {
             logger.error('Error restoring sessions')
             logger.error(e)
