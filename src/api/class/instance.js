@@ -517,151 +517,169 @@ class WhatsAppInstance {
     }
 
     getWhatsAppId(id) {
-        if (id.includes('@g.us') || id.includes('@s.whatsapp.net')) return id
+        if (
+            id.includes('@g.us') ||
+            id.includes('@s.whatsapp.net') ||
+            id.includes('@lid')
+        )
+            return id
         return id.includes('-') ? `${id}@g.us` : `${id}@s.whatsapp.net`
+    }
+
+    // Variantes BR para o 9o digito: 55 + DDD + local (8 ou 9 digitos).
+    // Retorna [original, alternativa] sem duplicar. Puro/testavel.
+    getBrazilVariants(number) {
+        const digits = String(number).replace(/\D/g, '')
+        if (!/^55\d{10,11}$/.test(digits)) return [digits]
+        const ddd = digits.slice(2, 4)
+        const local = digits.slice(4)
+        if (local.length === 9 && local.startsWith('9')) {
+            const without9 = `55${ddd}${local.slice(1)}`
+            return without9 === digits ? [digits] : [digits, without9]
+        }
+        if (local.length === 8) {
+            const with9 = `55${ddd}9${local}`
+            return with9 === digits ? [digits] : [digits, with9]
+        }
+        return [digits]
+    }
+
+    // Resolve o JID canonico via onWhatsApp, com fallback com/sem 9 no BR.
+    // Nunca envia para JID fantasma: usa result.jid quando disponivel.
+    async resolveWhatsAppId(id) {
+        const rawJid = this.getWhatsAppId(id)
+        if (rawJid.includes('@g.us') || rawJid.includes('@lid')) return rawJid
+        const number = rawJid.split('@')[0].replace(/\D/g, '')
+        const candidates = this.getBrazilVariants(number)
+        let lastError = null
+        for (const cand of candidates) {
+            try {
+                const [result] = (await this.instance.sock?.onWhatsApp(cand)) ?? []
+                if (result?.exists) {
+                    if (result?.jid) return result.jid
+                    return this.getWhatsAppId(cand)
+                }
+            } catch (e) {
+                lastError = e
+            }
+        }
+        if (lastError && candidates.length === 1) throw lastError
+        throw new Error('no account exists')
     }
 
     async verifyId(id) {
         if (id.includes('@g.us')) return true
-        const [result] = await this.instance.sock?.onWhatsApp(id)
-        if (result?.exists) return true
-        throw new Error('no account exists')
+        await this.resolveWhatsAppId(id)
+        return true
     }
 
     async sendTextMessage(to, message) {
-        await this.verifyId(this.getWhatsAppId(to))
-        const data = await this.instance.sock?.sendMessage(
-            this.getWhatsAppId(to),
-            { text: message }
-        )
+        const jid = await this.resolveWhatsAppId(to)
+        const data = await this.instance.sock?.sendMessage(jid, {
+            text: message,
+        })
         return data
     }
 
     async sendMediaFile(to, file, type, caption = '', filename) {
-        await this.verifyId(this.getWhatsAppId(to))
-        const data = await this.instance.sock?.sendMessage(
-            this.getWhatsAppId(to),
-            {
-                mimetype: file.mimetype,
-                [type]: file.buffer,
-                caption: caption,
-                ptt: type === 'audio' ? true : false,
-                fileName: filename ? filename : file.originalname,
-            }
-        )
+        const jid = await this.resolveWhatsAppId(to)
+        const data = await this.instance.sock?.sendMessage(jid, {
+            mimetype: file.mimetype,
+            [type]: file.buffer,
+            caption: caption,
+            ptt: type === 'audio' ? true : false,
+            fileName: filename ? filename : file.originalname,
+        })
         return data
     }
 
     async sendUrlMediaFile(to, url, type, mimeType, caption = '') {
-        await this.verifyId(this.getWhatsAppId(to))
+        const jid = await this.resolveWhatsAppId(to)
 
-        const data = await this.instance.sock?.sendMessage(
-            this.getWhatsAppId(to),
-            {
-                [type]: {
-                    url: url,
-                },
-                caption: caption,
-                mimetype: mimeType,
-            }
-        )
+        const data = await this.instance.sock?.sendMessage(jid, {
+            [type]: {
+                url: url,
+            },
+            caption: caption,
+            mimetype: mimeType,
+        })
         return data
     }
 
     async DownloadProfile(of) {
-        await this.verifyId(this.getWhatsAppId(of))
-        const ppUrl = await this.instance.sock?.profilePictureUrl(
-            this.getWhatsAppId(of),
-            'image'
-        )
+        const jid = await this.resolveWhatsAppId(of)
+        const ppUrl = await this.instance.sock?.profilePictureUrl(jid, 'image')
         return ppUrl
     }
 
     async getUserStatus(of) {
-        await this.verifyId(this.getWhatsAppId(of))
-        const status = await this.instance.sock?.fetchStatus(
-            this.getWhatsAppId(of)
-        )
+        const jid = await this.resolveWhatsAppId(of)
+        const status = await this.instance.sock?.fetchStatus(jid)
         return status
     }
 
     async blockUnblock(to, data) {
-        await this.verifyId(this.getWhatsAppId(to))
-        const status = await this.instance.sock?.updateBlockStatus(
-            this.getWhatsAppId(to),
-            data
-        )
+        const jid = await this.resolveWhatsAppId(to)
+        const status = await this.instance.sock?.updateBlockStatus(jid, data)
         return status
     }
 
     async sendButtonMessage(to, data) {
-        await this.verifyId(this.getWhatsAppId(to))
-        const result = await this.instance.sock?.sendMessage(
-            this.getWhatsAppId(to),
-            {
-                templateButtons: processButton(data.buttons),
-                text: data.text ?? '',
-                footer: data.footerText ?? '',
-                viewOnce: true,
-            }
-        )
+        const jid = await this.resolveWhatsAppId(to)
+        const result = await this.instance.sock?.sendMessage(jid, {
+            templateButtons: processButton(data.buttons),
+            text: data.text ?? '',
+            footer: data.footerText ?? '',
+            viewOnce: true,
+        })
         return result
     }
 
     async sendContactMessage(to, data) {
-        await this.verifyId(this.getWhatsAppId(to))
+        const jid = await this.resolveWhatsAppId(to)
         const vcard = generateVC(data)
-        const result = await this.instance.sock?.sendMessage(
-            await this.getWhatsAppId(to),
-            {
-                contacts: {
-                    displayName: data.fullName,
-                    contacts: [{ displayName: data.fullName, vcard }],
-                },
-            }
-        )
+        const result = await this.instance.sock?.sendMessage(jid, {
+            contacts: {
+                displayName: data.fullName,
+                contacts: [{ displayName: data.fullName, vcard }],
+            },
+        })
         return result
     }
 
     async sendListMessage(to, data) {
-        await this.verifyId(this.getWhatsAppId(to))
-        const result = await this.instance.sock?.sendMessage(
-            this.getWhatsAppId(to),
-            {
-                text: data.text,
-                sections: data.sections,
-                buttonText: data.buttonText,
-                footer: data.description,
-                title: data.title,
-                viewOnce: true,
-            }
-        )
+        const jid = await this.resolveWhatsAppId(to)
+        const result = await this.instance.sock?.sendMessage(jid, {
+            text: data.text,
+            sections: data.sections,
+            buttonText: data.buttonText,
+            footer: data.description,
+            title: data.title,
+            viewOnce: true,
+        })
         return result
     }
 
     async sendMediaButtonMessage(to, data) {
-        await this.verifyId(this.getWhatsAppId(to))
+        const jid = await this.resolveWhatsAppId(to)
 
-        const result = await this.instance.sock?.sendMessage(
-            this.getWhatsAppId(to),
-            {
-                [data.mediaType]: {
-                    url: data.image,
-                },
-                footer: data.footerText ?? '',
-                caption: data.text,
-                templateButtons: processButton(data.buttons),
-                mimetype: data.mimeType,
-                viewOnce: true,
-            }
-        )
+        const result = await this.instance.sock?.sendMessage(jid, {
+            [data.mediaType]: {
+                url: data.image,
+            },
+            footer: data.footerText ?? '',
+            caption: data.text,
+            templateButtons: processButton(data.buttons),
+            mimetype: data.mimeType,
+            viewOnce: true,
+        })
         return result
     }
 
     async setStatus(status, to) {
-        await this.verifyId(this.getWhatsAppId(to))
+        const jid = await this.resolveWhatsAppId(to)
 
-        const result = await this.instance.sock?.sendPresenceUpdate(status, to)
+        const result = await this.instance.sock?.sendPresenceUpdate(status, jid)
         return result
     }
 
@@ -1075,8 +1093,9 @@ class WhatsAppInstance {
                     key: key,
                 },
             }
+            const jid = await this.resolveWhatsAppId(id)
             const res = await this.instance.sock?.sendMessage(
-                this.getWhatsAppId(id),
+                jid,
                 reactionMessage
             )
             return res
