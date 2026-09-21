@@ -21,11 +21,26 @@ exports.init = async (req, res) => {
                 instance_data: instanceData,
             })
         }
+        // Re-init sobre instancia desconectada: derruba o socket antigo antes
+        // de sobrescrever, senao 2 sockets usam a mesma collection e o
+        // WhatsApp fecha um/ambos por conflito (QR nunca chega no objeto atual)
+        try {
+            instanceCheck.instance?.sock?.ev?.removeAllListeners()
+        } catch (_) {
+            // ignora: socket pode ja estar fechado
+        }
+        try {
+            instanceCheck.instance?.sock?.ws?.close()
+        } catch (_) {
+            // ignora: socket pode ja estar fechado
+        }
     }
 
     const webhook = !req.query.webhook ? false : req.query.webhook
     const webhookUrl = !req.query.webhookUrl ? null : req.query.webhookUrl
-    const appUrl = config.appUrl || req.protocol + '://' + req.headers.host
+    const rawAppUrl =
+        config.appUrl || req.protocol + '://' + req.headers.host
+    const appUrl = rawAppUrl.replace(/\/+$/, '')
     const instance = new WhatsAppInstance(key, webhook, webhookUrl)
     const data = await instance.init()
     WhatsAppInstances[data.key] = instance
@@ -65,6 +80,8 @@ exports.qrbase64 = async (req, res) => {
         const online = !!instance?.instance?.online
         const qrRetry = instance?.instance?.qrRetry ?? 0
         const maxRetry = Number(config.instance.maxRetryQr)
+        const registered = !!instance?.authState?.state?.creds?.registered
+        const lastDisconnect = instance?.instance?.lastDisconnect ?? null
 
         // Ja conectado: nao ha QR a escanear (evita falso sucesso com "")
         if (online) {
@@ -104,18 +121,26 @@ exports.qrbase64 = async (req, res) => {
                 qrRetry: qrRetry,
                 maxRetry: maxRetry,
                 expired: true,
+                registered: registered,
+                lastDisconnect: lastDisconnect,
             })
         }
 
-        // QR ainda nao gerado (race entre /init e evento qr do Baileys)
+        // QR ainda nao gerado. Se registered==true, o Baileys esta tentando
+        // resumir sessao antiga e nunca vai emitir QR: faca /logout ou
+        // /delete + /init para parear do zero
         return res.json({
             error: true,
-            message: 'QR not ready yet, try again in a few seconds',
+            message: registered
+                ? 'Session has stored credentials and is not emitting QR, call /logout or /delete + /init for a fresh pairing'
+                : 'QR not ready yet, try again in a few seconds',
             qrcode: '',
             connected: false,
             online: online,
             qrRetry: qrRetry,
             maxRetry: maxRetry,
+            registered: registered,
+            lastDisconnect: lastDisconnect,
         })
     } catch {
         res.json({
@@ -187,7 +212,20 @@ exports.logout = async (req, res) => {
 exports.delete = async (req, res) => {
     let errormsg
     try {
-        await WhatsAppInstances[req.query.key].deleteInstance(req.query.key)
+        const existing = WhatsAppInstances[req.query.key]
+        // Derruba o socket antes de remover da RAM, senao ele continua vivo
+        // (orfao) e conflita com um futuro /init da mesma key
+        try {
+            existing?.instance?.sock?.ev?.removeAllListeners()
+        } catch (_) {
+            // ignora
+        }
+        try {
+            existing?.instance?.sock?.ws?.close()
+        } catch (_) {
+            // ignora
+        }
+        await existing.deleteInstance(req.query.key)
         delete WhatsAppInstances[req.query.key]
     } catch (error) {
         errormsg = error

@@ -38,6 +38,7 @@ class WhatsAppInstance {
         qrRetry: 0,
         qrAt: null,
         online: false,
+        lastDisconnect: null,
         customWebhook: '',
     }
 
@@ -89,6 +90,7 @@ class WhatsAppInstance {
         this.instance.qrRetry = 0
         this.instance.qrAt = null
         this.instance.online = false
+        this.instance.lastDisconnect = null
         this.instance.sock = makeWASocket(this.socketConfig)
         this.setHandler()
         return this
@@ -138,6 +140,22 @@ class WhatsAppInstance {
 
             if (connection === 'close') {
                 this.instance.online = false
+                // Guarda o motivo para diagnostico via /info e /qrbase64
+                try {
+                    const statusCode =
+                        lastDisconnect?.error?.output?.statusCode ?? null
+                    const reason =
+                        lastDisconnect?.error?.message ??
+                        lastDisconnect?.error?.toString() ??
+                        null
+                    this.instance.lastDisconnect = {
+                        statusCode: statusCode,
+                        reason: reason,
+                        at: new Date().toISOString(),
+                    }
+                } catch (_) {
+                    // diagnostico nunca pode quebrar o handler
+                }
                 // reconnect if not logged out
                 if (
                     lastDisconnect?.error?.output?.statusCode !==
@@ -466,7 +484,8 @@ class WhatsAppInstance {
     async getInstanceDetail(key) {
         const online = !!this.instance?.online
         const sockUser = this.instance?.sock?.user
-        const credsMe = this.authState?.state?.creds?.me
+        const creds = this.authState?.state?.creds
+        const credsMe = creds?.me
         let user = {}
         if (sockUser && Object.keys(sockUser).length > 0) {
             user = { ...sockUser }
@@ -475,11 +494,25 @@ class WhatsAppInstance {
             // socket ainda conectando ou user ainda nao populado)
             user = { ...credsMe }
         }
+        const qr = this.instance?.qr ?? ''
+        const qrRetry = this.instance?.qrRetry ?? 0
+        const maxRetry = Number(config.instance.maxRetryQr)
         return {
             instance_key: key,
             phone_connected: online,
             webhookUrl: this.instance?.customWebhook ?? null,
             user: user,
+            // Diagnostico (nao quebra clientes antigos: so adiciona campos)
+            online: online,
+            hasQr: !!(qr && qr.trim() !== ''),
+            qrRetry: qrRetry,
+            maxRetry: maxRetry,
+            qrExpired: qrRetry >= maxRetry,
+            // true = Baileys tenta resumir sessao antiga e nunca emite QR
+            registered: !!creds?.registered,
+            credsMeId: credsMe?.id ?? null,
+            socketExists: !!this.instance?.sock,
+            lastDisconnect: this.instance?.lastDisconnect ?? null,
         }
     }
 
