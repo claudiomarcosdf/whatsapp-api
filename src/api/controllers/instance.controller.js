@@ -1,170 +1,343 @@
 const { WhatsAppInstance } = require('../class/instance')
-const fs = require('fs')
-const path = require('path')
 const config = require('../../config/config')
 const { Session } = require('../class/session')
+const { withInstanceLock } = require('../helper/instanceLock')
+
+function disconnectHint(statusCode) {
+    switch (statusCode) {
+        case 405:
+            return 'WhatsApp rejected the handshake (405 Method Not Allowed). Usually outdated WA Web version. Server already negotiates the live version; if this persists, rebuild without cache to update Baileys.'
+        case 440:
+            return 'Connection replaced (440). Another socket is using the same auth collection. Do not run the same key against the same MongoDB from two processes.'
+        case 401:
+            return 'Logged out (401). The session is invalid. Call DELETE /api/instance/delete then GET /api/instance/init with the same key for a fresh pairing.'
+        case 515:
+            return 'Restart required (515). The server already restarts the socket automatically; wait a few seconds and poll again.'
+        default:
+            return 'Socket closed before QR. Wait a few seconds and poll again. If it persists, check server logs for "connection errored".'
+    }
+}
+
+function disconnectAction(statusCode) {
+    if (statusCode === 401) return 'call_delete_and_init'
+    return 'wait_and_retry'
+}
+
+function snapshot(key) {
+    const inst = WhatsAppInstances[key]
+    return {
+        instance: inst,
+        qrcode: inst?.instance?.qr ?? '',
+        online: !!inst?.instance?.online,
+        qrRetry: inst?.instance?.qrRetry ?? 0,
+        maxRetry: Number(config.instance.maxRetryQr),
+        registered: !!inst?.authState?.state?.creds?.registered,
+        lastDisconnect: inst?.instance?.lastDisconnect ?? null,
+    }
+}
+
+// RAM -> Mongo restore -> create. Never throws for missing key,
+// so callers never need to worry about init/delete/restore order.
+async function ensureInstance(key, opts = {}) {
+    const { autoCreate = true, webhook = false, webhookUrl = null } = opts
+    if (!key) return { instance: null, mode: 'missing_key' }
+    if (WhatsAppInstances[key]) return { instance: WhatsAppInstances[key], mode: 'ram' }
+    try {
+        const session = new Session()
+        const restored = await session.restoreOne(key)
+        if (restored && WhatsAppInstances[key]) {
+            return { instance: WhatsAppInstances[key], mode: 'restored' }
+        }
+    } catch (_) {
+        // fall through to create
+    }
+    if (!autoCreate) return { instance: null, mode: 'not_found' }
+    const inst = new WhatsAppInstance(key, webhook, webhookUrl)
+    await inst.init()
+    WhatsAppInstances[inst.key] = inst
+    return { instance: inst, mode: 'created' }
+}
 
 exports.init = async (req, res) => {
-    const key = req.query.key
-    let instanceCheck = WhatsAppInstances[key]
-
-    /**
-     * Check if exists connected phone
-     * Error sending message if an instance with a connected phone already exists and another instance is created.
-     */
-    if (instanceCheck) {
-        const instanceData = await instanceCheck.getInstanceDetail(key)
-        if (instanceData?.phone_connected) {
-            return res.json({
-                error: false,
-                message: 'Phone connected to the created instance',
-                instance_data: instanceData,
-            })
-        }
-        // Re-init sobre instancia desconectada: derruba o socket antigo antes
-        // de sobrescrever, senao 2 sockets usam a mesma collection e o
-        // WhatsApp fecha um/ambos por conflito (QR nunca chega no objeto atual)
-        try {
-            instanceCheck.instance?.sock?.ev?.removeAllListeners()
-        } catch (_) {
-            // ignora: socket pode ja estar fechado
-        }
-        try {
-            instanceCheck.instance?.sock?.ws?.close()
-        } catch (_) {
-            // ignora: socket pode ja estar fechado
-        }
+    const key = req.query.key?.toString()
+    if (!key) {
+        return res.status(400).json({
+            error: true,
+            status: 'MISSING_KEY',
+            message: "Missing 'key' query param. Example: /api/instance/init?key=190",
+            action: 'provide_key',
+            hint: 'Pick any stable key per store/device, e.g. ?key=loja01. Then poll /qrbase64 with the same key.',
+        })
     }
+    try {
+        const result = await withInstanceLock(key, async () => {
+            const webhook = !req.query.webhook ? false : req.query.webhook
+            const webhookUrl = !req.query.webhookUrl ? null : req.query.webhookUrl
+            const rawAppUrl = config.appUrl || req.protocol + '://' + req.headers.host
+            const appUrl = rawAppUrl.replace(/\/+$/, '')
 
-    const webhook = !req.query.webhook ? false : req.query.webhook
-    const webhookUrl = !req.query.webhookUrl ? null : req.query.webhookUrl
-    const rawAppUrl =
-        config.appUrl || req.protocol + '://' + req.headers.host
-    const appUrl = rawAppUrl.replace(/\/+$/, '')
-    const instance = new WhatsAppInstance(key, webhook, webhookUrl)
-    const data = await instance.init()
-    WhatsAppInstances[data.key] = instance
-    res.json({
-        error: false,
-        message: 'Initializing successfully',
-        key: data.key,
-        webhook: {
-            enabled: webhook,
-            webhookUrl: webhookUrl,
-        },
-        qrcode: {
-            url: appUrl + '/instance/qr?key=' + data.key,
-        },
-        browser: config.browser,
-    })
+            const existing = WhatsAppInstances[key]
+            if (existing) {
+                const detail = await existing.getInstanceDetail(key)
+                if (detail?.phone_connected) {
+                    return {
+                        http: 200,
+                        body: {
+                            error: false,
+                            status: 'CONNECTED',
+                            message: `Instance '${key}' is already connected. No QR needed.`,
+                            action: 'none',
+                            key: key,
+                            instance_data: detail,
+                        },
+                    }
+                }
+                const s = snapshot(key)
+                if (s.qrcode && s.qrcode.trim() !== '' && s.qrcode.trim() !== ' ') {
+                    return {
+                        http: 200,
+                        body: {
+                            error: false,
+                            status: 'QR_READY',
+                            message: `Instance '${key}' already has a QR. Scan it now.`,
+                            action: 'scan_now',
+                            key: key,
+                            qrcode: {
+                                base64: s.qrcode,
+                                url: appUrl + '/instance/qr?key=' + key,
+                            },
+                            qrRetry: s.qrRetry,
+                            maxRetry: s.maxRetry,
+                            browser: config.browser,
+                        },
+                    }
+                }
+                // Disconnected without QR: recycle socket to avoid duplicates.
+                try {
+                    existing.teardownSocket?.() || existing.instance?.sock?.ws?.close()
+                } catch (_) {
+                    // ignora
+                }
+                const fresh = new WhatsAppInstance(key, webhook, webhookUrl)
+                await fresh.init()
+                WhatsAppInstances[key] = fresh
+                return {
+                    http: 200,
+                    body: {
+                        error: false,
+                        status: 'RECREATED',
+                        message: `Instance '${key}' was idle/disconnected and was recreated. Poll /qrbase64 every 3s.`,
+                        action: 'poll_qrbase64',
+                        key: key,
+                        qrcode: { url: appUrl + '/instance/qr?key=' + key },
+                        hint: `GET /api/instance/qrbase64?key=${key} every 3s for ~30s, then GET /api/instance/info?key=${key}.`,
+                        browser: config.browser,
+                    },
+                }
+            }
+
+            const instance = new WhatsAppInstance(key, webhook, webhookUrl)
+            const data = await instance.init()
+            WhatsAppInstances[data.key] = instance
+            return {
+                http: 200,
+                body: {
+                    error: false,
+                    status: 'CREATED',
+                    message: `Instance '${key}' initializing. QR is generated asynchronously; poll /qrbase64.`,
+                    action: 'poll_qrbase64',
+                    key: data.key,
+                    webhook: { enabled: webhook, webhookUrl: webhookUrl },
+                    qrcode: { url: appUrl + '/instance/qr?key=' + data.key },
+                    hint: `GET /api/instance/qrbase64?key=${data.key} every 3s for ~30s.`,
+                    browser: config.browser,
+                },
+            }
+        })
+        return res.status(result.http).json(result.body)
+    } catch (e) {
+        return res.status(500).json({
+            error: true,
+            status: 'INIT_FAILED',
+            message: `Could not initialize instance '${key}'.`,
+            action: 'retry_init',
+            hint: String(e?.message || e),
+            key: key,
+        })
+    }
 }
 
 exports.qr = async (req, res) => {
     try {
-        const qrcode =
-            WhatsAppInstances[req.query.key]?.instance.qr ?? ''
-        res.render('qrcode', {
-            qrcode: qrcode,
-        })
+        const key = req.query.key?.toString()
+        if (!key) {
+            return res.status(400).json({
+                error: true,
+                status: 'MISSING_KEY',
+                message: "Missing 'key' query param.",
+                action: 'provide_key',
+            })
+        }
+        const { instance } = await ensureInstance(key, { autoCreate: true })
+        const qrcode = instance?.instance?.qr ?? ''
+        res.render('qrcode', { qrcode: qrcode })
     } catch {
-        res.json({
-            qrcode: '',
-        })
+        res.json({ qrcode: '' })
     }
 }
 
 exports.qrbase64 = async (req, res) => {
+    const key = req.query.key?.toString()
+    if (!key) {
+        return res.status(400).json({
+            error: true,
+            status: 'MISSING_KEY',
+            message: "Missing 'key' query param. Example: /api/instance/qrbase64?key=190",
+            action: 'provide_key',
+            hint: 'Use the same key you passed to /init.',
+            qrcode: '',
+        })
+    }
     try {
-        const instance = WhatsAppInstances[req.query.key]
-        const qrcode = instance?.instance?.qr ?? ''
-        const online = !!instance?.instance?.online
-        const qrRetry = instance?.instance?.qrRetry ?? 0
-        const maxRetry = Number(config.instance.maxRetryQr)
-        const registered = !!instance?.authState?.state?.creds?.registered
-        const lastDisconnect = instance?.instance?.lastDisconnect ?? null
+        const ensured = await withInstanceLock(key, async () =>
+            ensureInstance(key, { autoCreate: true })
+        )
+        const s = snapshot(key)
+        const maxRetry = s.maxRetry
 
-        // Ja conectado: nao ha QR a escanear (evita falso sucesso com "")
-        if (online) {
+        if (s.online) {
             return res.json({
                 error: false,
-                message: 'Phone connected, QR not needed',
+                status: 'CONNECTED',
+                message: `Instance '${key}' is connected. No QR needed.`,
+                action: 'none',
                 qrcode: '',
                 connected: true,
-                online: online,
-                qrRetry: qrRetry,
+                online: true,
+                qrRetry: s.qrRetry,
                 maxRetry: maxRetry,
+                key: key,
             })
         }
 
-        // QR valido disponivel
-        if (qrcode && qrcode.trim() !== '') {
+        if (s.qrcode && s.qrcode.trim() !== '' && s.qrcode.trim() !== ' ') {
             return res.json({
                 error: false,
-                message: 'QR Base64 fetched successfully',
-                qrcode: qrcode,
+                status: 'QR_READY',
+                message: 'QR Base64 fetched successfully. Scan it now; it expires fast.',
+                action: 'scan_now',
+                qrcode: s.qrcode,
                 connected: false,
-                online: online,
-                qrRetry: qrRetry,
+                online: false,
+                qrRetry: s.qrRetry,
                 maxRetry: maxRetry,
+                key: key,
             })
         }
 
-        // QR expirado pelo maxRetry (instance.js seta ' ' ao encerrar)
-        if (qrRetry >= maxRetry) {
+        if (s.qrRetry >= maxRetry) {
             return res.json({
                 error: true,
-                message:
-                    'QR expired, call /instance/init with the same key to generate a new one',
+                status: 'QR_EXPIRED',
+                message: `QR expired for '${key}' (attempts ${s.qrRetry}/${maxRetry}). A fresh QR was requested automatically; poll again. If this repeats, call DELETE then INIT.`,
+                action: 'poll_qrbase64',
+                hint: `GET /api/instance/init?key=${key} recreates the socket, then poll this endpoint every 3s.`,
                 qrcode: '',
                 connected: false,
-                online: online,
-                qrRetry: qrRetry,
+                online: false,
+                qrRetry: s.qrRetry,
                 maxRetry: maxRetry,
-                expired: true,
-                registered: registered,
-                lastDisconnect: lastDisconnect,
+                registered: s.registered,
+                lastDisconnect: s.lastDisconnect,
+                key: key,
             })
         }
 
-        // QR ainda nao gerado. Se registered==true, o Baileys esta tentando
-        // resumir sessao antiga e nunca vai emitir QR: faca /logout ou
-        // /delete + /init para parear do zero
+        const code = s.lastDisconnect?.statusCode ?? null
+        if (code === 405 || code === 440 || code === 401 || code === 515) {
+            return res.json({
+                error: true,
+                status: 'CONNECTION_FAILED',
+                message: `Instance '${key}' failed before QR (status ${code}). ${disconnectHint(code)}`,
+                action: disconnectAction(code),
+                hint:
+                    code === 401
+                        ? `DELETE /api/instance/delete?key=${key} then GET /api/instance/init?key=${key}.`
+                        : `Wait 5s and poll again. Check server logs for "connection errored". Instance was ${ensured.mode}.`,
+                qrcode: '',
+                connected: false,
+                online: false,
+                qrRetry: s.qrRetry,
+                maxRetry: maxRetry,
+                registered: s.registered,
+                lastDisconnect: s.lastDisconnect,
+                key: key,
+            })
+        }
+
         return res.json({
             error: true,
-            message: registered
-                ? 'Session has stored credentials and is not emitting QR, call /logout or /delete + /init for a fresh pairing'
-                : 'QR not ready yet, try again in a few seconds',
+            status: ensured.mode === 'created' ? 'INITIALIZING' : 'CONNECTING',
+            message:
+                ensured.mode === 'created'
+                    ? `Instance '${key}' just created. QR not ready yet, poll again in 3 seconds.`
+                    : 'QR not ready yet, try again in a few seconds.',
+            action: 'wait_and_retry',
+            hint: `Poll GET /api/instance/qrbase64?key=${key} every 3s for ~30s. Check GET /api/instance/info?key=${key} for lastDisconnect.`,
             qrcode: '',
             connected: false,
-            online: online,
-            qrRetry: qrRetry,
+            online: false,
+            qrRetry: s.qrRetry,
             maxRetry: maxRetry,
-            registered: registered,
-            lastDisconnect: lastDisconnect,
+            registered: s.registered,
+            lastDisconnect: s.lastDisconnect,
+            key: key,
         })
-    } catch {
-        res.json({
+    } catch (e) {
+        return res.json({
             error: true,
-            message: 'Unable to fetch QR',
+            status: 'QR_FETCH_FAILED',
+            message: 'Unable to fetch QR. Retry /init then /qrbase64.',
+            action: 'retry_init',
+            hint: String(e?.message || e),
             qrcode: '',
+            key: key,
         })
     }
 }
 
 exports.info = async (req, res) => {
-    const instance = WhatsAppInstances[req.query.key]
+    const key = req.query.key?.toString()
+    if (!key) {
+        return res.status(400).json({
+            error: true,
+            status: 'MISSING_KEY',
+            message: "Missing 'key' query param.",
+            action: 'provide_key',
+        })
+    }
+    const instance = WhatsAppInstances[key]
+    if (!instance) {
+        return res.status(404).json({
+            error: true,
+            status: 'NOT_FOUND',
+            message: `Instance '${key}' not found on this server.`,
+            action: 'call_init',
+            hint: `GET /api/instance/init?key=${key} then poll /qrbase64. Each VPS has its own MongoDB, so create the key on this VPS.`,
+            key: key,
+        })
+    }
     let data
     try {
-        data = await instance.getInstanceDetail(req.query.key)
+        data = await instance.getInstanceDetail(key)
     } catch (error) {
         data = {
-            instance_key: req.query.key,
+            instance_key: key,
             phone_connected: false,
             webhookUrl: null,
             user: {},
         }
     }
-    // Garante formato estavel: phone_connected sempre boolean, user sempre objeto
     if (typeof data.phone_connected !== 'boolean') {
         data.phone_connected = !!data.phone_connected
     }
@@ -176,7 +349,9 @@ exports.info = async (req, res) => {
     }
     return res.json({
         error: false,
-        message: 'Instance fetched successfully',
+        status: data.phone_connected ? 'CONNECTED' : data.hasQr ? 'QR_READY' : 'CONNECTING',
+        message: 'Instance fetched successfully.',
+        action: data.phone_connected ? 'none' : data.hasQr ? 'scan_now' : 'poll_qrbase64',
         instance_data: data,
     })
 }
@@ -187,7 +362,9 @@ exports.restore = async (req, res, next) => {
         let restoredSessions = await session.restoreSessions()
         return res.json({
             error: false,
-            message: 'All instances restored',
+            status: 'RESTORED',
+            message: 'All instances restored.',
+            action: 'none',
             data: restoredSessions,
         })
     } catch (error) {
@@ -196,44 +373,67 @@ exports.restore = async (req, res, next) => {
 }
 
 exports.logout = async (req, res) => {
-    let errormsg
+    const key = req.query.key?.toString()
+    let errormsg = null
     try {
-        await WhatsAppInstances[req.query.key].instance?.sock?.logout()
+        await withInstanceLock(key, async () => {
+            await WhatsAppInstances[key]?.instance?.sock?.logout()
+        })
     } catch (error) {
-        errormsg = error
+        errormsg = String(error?.message || error)
     }
     return res.json({
         error: false,
-        message: 'logout successfull',
-        errormsg: errormsg ? errormsg : null,
+        status: 'LOGGED_OUT',
+        message: `Logout requested for '${key}'. Pair again via /init + /qrbase64.`,
+        action: 'call_init',
+        errormsg: errormsg,
+        key: key,
     })
 }
 
 exports.delete = async (req, res) => {
-    let errormsg
+    const key = req.query.key?.toString()
+    if (!key) {
+        return res.status(400).json({
+            error: true,
+            status: 'MISSING_KEY',
+            message: "Missing 'key' query param.",
+            action: 'provide_key',
+        })
+    }
+    let errormsg = null
     try {
-        const existing = WhatsAppInstances[req.query.key]
-        // Derruba o socket antes de remover da RAM, senao ele continua vivo
-        // (orfao) e conflita com um futuro /init da mesma key
-        try {
-            existing?.instance?.sock?.ev?.removeAllListeners()
-        } catch (_) {
-            // ignora
-        }
-        try {
-            existing?.instance?.sock?.ws?.close()
-        } catch (_) {
-            // ignora
-        }
-        await existing.deleteInstance(req.query.key)
-        delete WhatsAppInstances[req.query.key]
+        await withInstanceLock(key, async () => {
+            const existing = WhatsAppInstances[key]
+            try {
+                existing?.teardownSocket?.()
+            } catch (_) {
+                // ignora
+            }
+            try {
+                existing?.instance?.sock?.ev?.removeAllListeners()
+            } catch (_) {
+                // ignora
+            }
+            try {
+                existing?.instance?.sock?.ws?.close()
+            } catch (_) {
+                // ignora
+            }
+            if (existing) await existing.deleteInstance(key)
+            delete WhatsAppInstances[key]
+        })
     } catch (error) {
-        errormsg = error
+        errormsg = String(error?.message || error)
     }
     return res.json({
         error: false,
-        message: 'Instance deleted successfully',
-        data: errormsg ? errormsg : null,
+        status: 'DELETED',
+        message: `Instance '${key}' deleted. Create again with /init?key=${key}.`,
+        action: 'call_init',
+        data: errormsg,
+        key: key,
     })
 }
 
@@ -248,7 +448,9 @@ exports.list = async (req, res) => {
 
         return res.json({
             error: false,
-            message: 'All active instance',
+            status: 'LISTED',
+            message: 'All active instances (MongoDB collections).',
+            action: 'none',
             data: instance,
         })
     }
@@ -260,7 +462,10 @@ exports.list = async (req, res) => {
 
     return res.json({
         error: false,
-        message: 'All instance listed',
+        status: 'LISTED',
+        message: 'All instances in this server memory. Empty means none created here yet or server restarted without restore.',
+        action: data.length === 0 ? 'call_init' : 'none',
+        count: data.length,
         data: data,
     })
 }

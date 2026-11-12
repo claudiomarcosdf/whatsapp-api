@@ -4,6 +4,8 @@ const pino = require('pino')
 const {
     default: makeWASocket,
     DisconnectReason,
+    fetchLatestBaileysVersion,
+    fetchLatestWaWebVersion,
 } = require('@whiskeysockets/baileys')
 const { unlinkSync } = require('fs')
 const { v4: uuidv4 } = require('uuid')
@@ -73,18 +75,56 @@ class WhatsAppInstance {
             .catch(() => {})
     }
 
+    teardownSocket() {
+        try {
+            this.instance.sock?.ev?.removeAllListeners()
+        } catch (_) {
+            // ignora: socket pode ja estar fechado
+        }
+        try {
+            this.instance.sock?.ws?.close()
+        } catch (_) {
+            // ignora: socket pode ja estar fechado
+        }
+    }
+
+    async getFreshWAVersion() {
+        // WhatsApp rejects outdated web clients on fresh pairing with
+        // `connected to WA -> attempting registration -> Connection Failure`
+        // and never emits QR. Always negotiate the live version first.
+        try {
+            const { version } = await fetchLatestWaWebVersion({ timeout: 10000 })
+            if (Array.isArray(version) && version.length === 3) {
+                logger.info(`Using WA Web version ${version.join('.')}`)
+                return version
+            }
+        } catch (e) {
+            logger.error('fetchLatestWaWebVersion failed, trying Baileys version')
+            logger.error(e?.message || e)
+        }
+        try {
+            const { version } = await fetchLatestBaileysVersion({ timeout: 10000 })
+            if (Array.isArray(version) && version.length === 3) {
+                logger.info(`Using Baileys version ${version.join('.')}`)
+                return version
+            }
+        } catch (e) {
+            logger.error('fetchLatestBaileysVersion failed, using pinned fallback')
+            logger.error(e?.message || e)
+        }
+        // Pinned fallback (Oct/2026). Updated when WhatsApp bumps again.
+        return [2, 3000, 1043857760]
+    }
+
     async init() {
         this.collection = mongoClient.db('whatsapp-api').collection(this.key)
         const { state, saveCreds } = await useMongoDBAuthState(this.collection)
         this.authState = { state: state, saveCreds: saveCreds }
         this.socketConfig.auth = this.authState.state
         this.socketConfig.browser = Object.values(config.browser)
+        this.socketConfig.version = await this.getFreshWAVersion()
         // Novo ciclo: limpa estado anterior sem acumular entre reconexoes
-        try {
-            this.instance.sock?.ev?.removeAllListeners()
-        } catch (_) {
-            // ignora: socket anterior pode ja estar fechado
-        }
+        this.teardownSocket()
         this.instance.key = this.key
         this.instance.qr = ''
         this.instance.qrRetry = 0
@@ -100,6 +140,24 @@ class WhatsAppInstance {
         const sock = this.instance.sock
         // on credentials update save state
         sock?.ev.on('creds.update', this.authState.saveCreds)
+
+        // Baileys logs `connection errored` internally on handshake failures
+        // (e.g. outdated WA version -> 405) without always emitting
+        // `connection.update { connection: 'close' }` first. Capture it so
+        // /info and /qrbase64 never stay stuck on `lastDisconnect: null`.
+        try {
+            sock?.ws?.on('error', (err) => {
+                if (!this.instance.lastDisconnect) {
+                    this.instance.lastDisconnect = {
+                        statusCode: err?.output?.statusCode ?? null,
+                        reason: err?.message || String(err),
+                        at: new Date().toISOString(),
+                    }
+                }
+            })
+        } catch (_) {
+            // diagnostico nunca pode quebrar o handler
+        }
 
         // on socket closed, opened, connecting
         sock?.ev.on('connection.update', async (update) => {
@@ -162,6 +220,9 @@ class WhatsAppInstance {
                     DisconnectReason.loggedOut
                 ) {
                     try {
+                        // Small backoff avoids hot-loop on 405/440 handshake
+                        // rejections (new pairing with outdated WA version).
+                        await new Promise((resolve) => setTimeout(resolve, 2000))
                         await this.init()
                     } catch (e) {
                         logger.error('Error reconnecting instance')

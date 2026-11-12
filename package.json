@@ -36,7 +36,7 @@
     "license": "MIT",
     "dependencies": {
         "@adiwajshing/keyed-db": "^0.2.4",
-        "@whiskeysockets/baileys": "^6.1.0",
+        "@whiskeysockets/baileys": "6.7.23",
         "axios": "^1.6.1",
         "dotenv": "^16.0.3",
         "ejs": "^3.1.7",

@@ -4,6 +4,26 @@ const logger = require('pino')()
 const config = require('../../config/config')
 
 class Session {
+    async restoreOne(key) {
+        if (!key) return null
+        if (WhatsAppInstances[key]) return key
+        try {
+            const db = mongoClient.db('whatsapp-api')
+            const collections = await db.listCollections({ name: key }).toArray()
+            if (!collections || collections.length === 0) return null
+            const webhook = !config.webhookEnabled ? undefined : config.webhookEnabled
+            const webhookUrl = !config.webhookUrl ? undefined : config.webhookUrl
+            const instance = new WhatsAppInstance(key, webhook, webhookUrl)
+            await instance.init()
+            WhatsAppInstances[key] = instance
+            return key
+        } catch (err) {
+            logger.error(`Error restoring session ${key}`)
+            logger.error(err)
+            return null
+        }
+    }
+
     async restoreSessions() {
         let restoredSessions = new Array()
         let allCollections = []
